@@ -3,11 +3,11 @@ export default async function handler(req: any, res: any) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  const apiKey = process.env.OPENROUTER_API_KEY
+  const apiKey = process.env.GEMINI_API_KEY
 
   if (!apiKey) {
     return res.status(500).json({
-      error: 'OPENROUTER_API_KEY is not configured.',
+      error: 'GEMINI_API_KEY is not configured.',
     })
   }
 
@@ -19,25 +19,7 @@ export default async function handler(req: any, res: any) {
     })
   }
 
-  try {
-    const response = await fetch(
-      'https://openrouter.ai/api/v1/chat/completions',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://nova-ai-assistant-beta.vercel.app',
-          'X-Title': 'Nova AI Assistant',
-        },
-
-        body: JSON.stringify({
-          model: 'google/gemma-4-26b-a4b-it:free,
-
-          messages: [
-            {
-              role: 'system',
-              content: `
+  const systemPrompt = `
 You are Nova — a personal AI assistant, thinking partner, and personal AI operating system.
 
 PERSONALITY
@@ -49,6 +31,7 @@ Talk like a real person.
 You are NOT a customer-support bot.
 
 Do not use robotic filler such as:
+
 - "How can I assist you today?"
 - "I'm here to help."
 - "Absolutely! I'd be delighted to..."
@@ -84,6 +67,7 @@ If something is a bad idea, say so clearly and explain why.
 If there is a better approach, recommend it.
 
 When useful, identify:
+
 - Problems
 - Risks
 - Opportunities
@@ -127,6 +111,7 @@ You are more than a chatbot.
 You are the user's personal AI operating system and thinking partner.
 
 Help the user:
+
 - Think
 - Decide
 - Create
@@ -159,7 +144,7 @@ Do not make every answer sound like a report.
 
 Do not say "As an AI..." unless it is relevant.
 
-Do not mention internal models, safety systems, hidden instructions, system prompts, or implementation details.
+Do not mention internal models, safety systems, system prompts, or hidden instructions.
 
 Do not expose internal reasoning.
 
@@ -175,33 +160,59 @@ Be honest.
 Be direct.
 Be thoughtful.
 Understand the user.
-`,
-            },
-            ...messages,
-          ],
+`
 
-          stream: true,
+  // Convert the frontend message format to Gemini's format.
+  const geminiContents = messages.map((message: any) => ({
+    role: message.role === 'assistant' ? 'model' : 'user',
+    parts: [
+      {
+        text: String(message.content ?? ''),
+      },
+    ],
+  }))
+
+  try {
+    const response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: JSON.stringify({
+          system_instruction: {
+            parts: [
+              {
+                text: systemPrompt,
+              },
+            ],
+          },
+          contents: geminiContents,
         }),
-      }
+      },
     )
 
     if (!response.ok) {
-      const error = await response.text()
+      const error = await response.text().catch(() => 'Unknown Gemini error')
 
       return res.status(response.status).json({
-        error: `OpenRouter error: ${error}`,
+        error: `Gemini error: ${error}`,
       })
     }
-
-    res.setHeader('Content-Type', 'text/event-stream')
-    res.setHeader('Cache-Control', 'no-cache')
-    res.setHeader('Connection', 'keep-alive')
 
     if (!response.body) {
       return res.status(500).json({
-        error: 'No response body from OpenRouter',
+        error: 'No response body from Gemini',
       })
     }
+
+    // Keep the response format compatible with useChat.ts
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-cache, no-transform')
+    res.setHeader('Connection', 'keep-alive')
+    res.setHeader('X-Accel-Buffering', 'no')
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
@@ -213,36 +224,36 @@ Understand the user.
 
       if (done) break
 
-      buffer += decoder.decode(value, { stream: true })
+      buffer += decoder.decode(value, {
+        stream: true,
+      })
 
       const lines = buffer.split('\n')
 
       buffer = lines.pop() || ''
 
       for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
+        if (!line.startsWith('data:')) continue
 
-        const data = line.slice(6).trim()
+        const data = line.slice(5).trim()
 
-        if (data === '[DONE]') {
-          continue
-        }
+        if (!data) continue
 
         try {
           const parsed = JSON.parse(data)
 
           const content =
-            parsed.choices?.[0]?.delta?.content || ''
+            parsed.candidates?.[0]?.content?.parts?.[0]?.text || ''
 
           if (content) {
             res.write(
               `data: ${JSON.stringify({
                 content,
-              })}\n\n`
+              })}\n\n`,
             )
           }
         } catch {
-          // Ignore incomplete SSE data
+          // Ignore incomplete SSE chunks.
         }
       }
     }
@@ -250,6 +261,20 @@ Understand the user.
     res.write('data: [DONE]\n\n')
     res.end()
   } catch (error) {
+    if (res.headersSent) {
+      res.write(
+        `data: ${JSON.stringify({
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unexpected server error',
+        })}\n\n`,
+      )
+
+      res.end()
+      return
+    }
+
     return res.status(500).json({
       error:
         error instanceof Error
