@@ -1,6 +1,8 @@
 export default async function handler(req: any, res: any) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
+    return res.status(405).json({
+      error: 'Method not allowed',
+    })
   }
 
   const apiKey = process.env.GEMINI_API_KEY
@@ -162,40 +164,55 @@ Be thoughtful.
 Understand the user.
 `
 
-  // Convert the frontend message format to Gemini's format.
-  const geminiContents = messages.map((message: any) => ({
-    role: message.role === 'assistant' ? 'model' : 'user',
-    parts: [
-      {
-        text: String(message.content ?? ''),
-      },
-    ],
-  }))
+  /*
+   * Convert the frontend's OpenAI-style messages into
+   * a single text input for Gemini Interactions API.
+   *
+   * We keep the whole conversation because our current
+   * frontend already sends the conversation history.
+   */
+  const conversation = messages
+    .map((message: any) => {
+      const role =
+        message.role === 'assistant'
+          ? 'Nova'
+          : 'User'
+
+      return `${role}: ${String(message.content ?? '')}`
+    })
+    .join('\n\n')
 
   try {
     const response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+      'https://generativelanguage.googleapis.com/v1beta/interactions',
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'x-goog-api-key': apiKey,
+          Accept: 'text/event-stream',
         },
         body: JSON.stringify({
-          system_instruction: {
-            parts: [
-              {
-                text: systemPrompt,
-              },
-            ],
-          },
-          contents: geminiContents,
+          model: 'gemini-3.6-flash',
+
+          system_instruction: systemPrompt,
+
+          input: conversation,
+
+          stream: true,
+
+          // We are currently sending the conversation ourselves.
+          // This keeps the API stateless while we get the basic
+          // Nova chat working.
+          store: false,
         }),
       },
     )
 
     if (!response.ok) {
-      const error = await response.text().catch(() => 'Unknown Gemini error')
+      const error = await response.text().catch(
+        () => 'Unknown Gemini error',
+      )
 
       return res.status(response.status).json({
         error: `Gemini error: ${error}`,
@@ -208,9 +225,17 @@ Understand the user.
       })
     }
 
-    // Keep the response format compatible with useChat.ts
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8')
-    res.setHeader('Cache-Control', 'no-cache, no-transform')
+    /*
+     * Keep the response format compatible with useChat.ts.
+     */
+    res.setHeader(
+      'Content-Type',
+      'text/event-stream; charset=utf-8',
+    )
+    res.setHeader(
+      'Cache-Control',
+      'no-cache, no-transform',
+    )
     res.setHeader('Connection', 'keep-alive')
     res.setHeader('X-Accel-Buffering', 'no')
 
@@ -237,23 +262,34 @@ Understand the user.
 
         const data = line.slice(5).trim()
 
-        if (!data) continue
+        if (!data || data === '[DONE]') continue
 
         try {
           const parsed = JSON.parse(data)
 
-          const content =
-            parsed.candidates?.[0]?.content?.parts?.[0]?.text || ''
+          /*
+           * Gemini Interactions streaming format:
+           *
+           * event_type: "step.delta"
+           * delta.type: "text"
+           * delta.text: "..."
+           */
+          if (
+            parsed.event_type === 'step.delta' &&
+            parsed.delta?.type === 'text'
+          ) {
+            const content = parsed.delta.text || ''
 
-          if (content) {
-            res.write(
-              `data: ${JSON.stringify({
-                content,
-              })}\n\n`,
-            )
+            if (content) {
+              res.write(
+                `data: ${JSON.stringify({
+                  content,
+                })}\n\n`,
+              )
+            }
           }
         } catch {
-          // Ignore incomplete SSE chunks.
+          // Ignore malformed/incomplete SSE data.
         }
       }
     }
